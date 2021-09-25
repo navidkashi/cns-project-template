@@ -50,3 +50,78 @@ class AbstractReward(ABC):
 
         """
         pass
+
+
+class RPE(AbstractReward):
+
+    def __init__(
+            self,
+    ) -> None:
+        self.predicted_reward = 0.0
+        self.reward = 0.0
+        self.last_reward = 0.0
+
+    def compute(self, **kwargs) -> None:
+        """
+        Compute the reward.
+
+        Returns
+        -------
+        None
+            It should return the computed reward value.
+
+        """
+
+        self.predicted_reward = kwargs.get("gamma", 0.05) * self.last_reward + self.reward
+        actual_reward = kwargs.get("actual_reward", 0.0)
+        self.last_reward = self.reward
+        self.reward = actual_reward
+        return actual_reward - self.predicted_reward
+
+
+
+    def update(self, **kwargs) -> None:
+        """
+        Update the internal variables.
+
+        Returns
+        -------
+        None
+
+        """
+        pass
+
+
+class RawReward(AbstractReward):
+    def __init__(
+            self,
+    ) -> None:
+        pass
+
+    def compute(self, **kwargs) -> None:
+        """
+        Compute the reward.
+
+        Returns
+        -------
+        None
+            It should return the computed reward value.
+
+        """
+
+        actual_reward = kwargs.get("actual_reward", 0.0)
+
+        return actual_reward
+
+
+
+    def update(self, **kwargs) -> None:
+        """
+        Update the internal variables.
+
+        Returns
+        -------
+        None
+
+        """
+        pass

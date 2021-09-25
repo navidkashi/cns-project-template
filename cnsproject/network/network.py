@@ -62,12 +62,12 @@ class Network(torch.nn.Module):
     """
 
     def __init__(
-        self,
-        dt: float = 1.0,
-        learning: bool = True,
-        reward: Optional[AbstractReward] = None,
-        decision: Optional[AbstractDecision] = None,
-        **kwargs
+            self,
+            dt: float = 1.0,
+            learning: bool = True,
+            reward: Optional[AbstractReward] = None,
+            decision: Optional[AbstractDecision] = None,
+            **kwargs
     ) -> None:
         super().__init__()
 
@@ -82,8 +82,20 @@ class Network(torch.nn.Module):
         # Make sure that arguments of your reward and decision classes do not
         # share same names. Their arguments are passed to the network as its
         # keyword arguments.
-        self.reward = reward(**kwargs)
-        self.decision = decision(**kwargs)
+        if reward is not None:
+            self.reward = reward(**kwargs)
+        else:
+            self.reward = None
+
+        if decision is not None:
+            self.decision = decision(**kwargs)
+        else:
+            self.decision = None
+
+        self.dopamine = None
+        self.actual_reward = None
+        self.predicted_reward = None
+
 
     def add_layer(self, layer: NeuralPopulation, name: str) -> None:
         """
@@ -103,15 +115,14 @@ class Network(torch.nn.Module):
         """
         self.layers[name] = layer
         self.add_module(name, layer)
-
         layer.train(self.learning)
         layer.dt = self.dt
 
     def add_connection(
-        self,
-        connection: AbstractConnection,
-        pre: str,
-        post: str
+            self,
+            connection: AbstractConnection,
+            pre: str,
+            post: str
     ) -> None:
         """
         Add a connection between neural populations to the network. The\
@@ -154,14 +165,14 @@ class Network(torch.nn.Module):
 
         """
         self.monitors[name] = monitor
-        monitor.dt = self.dt
+        # monitor.dt = self.dt
 
     def run(
-        self,
-        time: int,
-        inputs: Dict[str, torch.Tensor] = {},
-        one_step: bool = False,
-        **kwargs
+            self,
+            time: int,
+            inputs: Dict[str, torch.Tensor] = None,
+            one_step: bool = False,
+            **kwargs
     ) -> None:
         """
         Simulate network for a specific time duration with the possible given\
@@ -215,6 +226,62 @@ class Network(torch.nn.Module):
         clamps = kwargs.get("clamp", {})
         unclamps = kwargs.get("unclamp", {})
         masks = kwargs.get("masks", {})
+        env_reward = kwargs.get("env_reward", None)
+        kwargs["dopamine"] = 0
+        self.reset_state_variables()
+
+        for t in range(int(time / self.dt)):
+
+            for layer in inputs:
+                if layer in self.layers:
+                    self.layers[layer].forward(inputs[layer][t])
+
+            potential_inputs = {}
+            for con in self.connections:
+                # Check whether name of post population in connection definition is in layers or not.
+                post = con.split('_to_')[1]
+                if post in self.layers:
+                    # Update potential injection on post population.
+                    if post in potential_inputs:
+                        potential_inputs[post] += self.connections[con].compute()
+                    else:
+                        potential_inputs[post] = self.connections[con].compute()
+
+            if self.decision is not None:
+                decision_pop_name = kwargs.get('decision_pop', None)
+                assert decision_pop_name is not None, 'Decision Population required.'
+                decision_pop = self.layers.get(decision_pop_name, None)
+                assert decision_pop is not None, 'Decision Population not found.'
+                done, winners, inhibition_pot = self.decision.compute(decision_pop, **kwargs)
+                kwargs['winners'] = winners
+
+                if decision_pop_name in potential_inputs:
+                    potential_inputs[decision_pop_name] += inhibition_pot
+                else:
+                    potential_inputs[decision_pop_name] = inhibition_pot
+
+            for con in self.connections:
+                self.connections[con].update(**kwargs)
+
+
+            for layer in potential_inputs:
+                self.layers[layer].inject_v = potential_inputs[layer]
+            for layer in self.layers:
+                if layer not in inputs:
+                    self.layers[layer].forward(torch.zeros(*self.layers[layer].s.shape))
+
+            if env_reward is not None:
+                kwargs["actual_reward"] = env_reward(self.layers["input"].s, self.layers["output"].s)
+                kwargs["dopamine"] += (self.reward.compute(**kwargs) - (kwargs["dopamine"] / kwargs.get("tau_d", 10))) * self.dt
+
+                self.dopamine = torch.tensor(kwargs["dopamine"]) # for plotting only
+            # print(t)
+
+
+
+
+            for m in self.monitors:
+                self.monitors[m].record()
 
     def reset_state_variables(self) -> None:
         """
@@ -233,6 +300,9 @@ class Network(torch.nn.Module):
 
         for monitor in self.monitors:
             self.monitors[monitor].reset_state_variables()
+
+        if self.decision is not None:
+            self.decision.reset_state_variables()
 
     def train(self, mode: bool = True) -> "torch.nn.Moudle":
         """

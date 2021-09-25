@@ -7,8 +7,8 @@ from typing import Union, Optional, Sequence
 
 import numpy as np
 import torch
-
-from ..network.connections import AbstractConnection
+from cnsproject.utils import sign
+from ..network.connections import *
 
 
 class LearningRule(ABC):
@@ -39,12 +39,13 @@ class LearningRule(ABC):
     """
 
     def __init__(
-        self,
-        connection: AbstractConnection,
-        lr: Optional[Union[float, Sequence[float]]] = None,
-        weight_decay: float = 0.,
-        **kwargs
+            self,
+            connection: AbstractConnection,
+            lr: Optional[Union[float, Sequence[float]]] = None,
+            weight_decay: float = 0.,
+            **kwargs
     ) -> None:
+        self.connection = connection
         if lr is None:
             lr = [0., 0.]
         elif isinstance(lr, float) or isinstance(lr, int):
@@ -67,7 +68,7 @@ class LearningRule(ABC):
             self.connection.w *= self.weight_decay
 
         if (
-            self.connection.wmin != -np.inf or self.connection.wmax != np.inf
+                self.connection.wmin != -np.inf or self.connection.wmax != np.inf
         ) and not isinstance(self.connection, NoOp):
             self.connection.w.clamp_(self.connection.wmin,
                                      self.connection.wmax)
@@ -91,11 +92,11 @@ class NoOp(LearningRule):
     """
 
     def __init__(
-        self,
-        connection: AbstractConnection,
-        lr: Optional[Union[float, Sequence[float]]] = None,
-        weight_decay: float = 0.,
-        **kwargs
+            self,
+            connection: AbstractConnection,
+            lr: Optional[Union[float, Sequence[float]]] = None,
+            weight_decay: float = 0.,
+            **kwargs
     ) -> None:
         super().__init__(
             connection=connection,
@@ -126,11 +127,11 @@ class STDP(LearningRule):
     """
 
     def __init__(
-        self,
-        connection: AbstractConnection,
-        lr: Optional[Union[float, Sequence[float]]] = None,
-        weight_decay: float = 0.,
-        **kwargs
+            self,
+            connection: AbstractConnection,
+            lr: Optional[Union[float, Sequence[float]]] = None,
+            weight_decay: float = 0.,
+            **kwargs
     ) -> None:
         super().__init__(
             connection=connection,
@@ -145,14 +146,49 @@ class STDP(LearningRule):
         accordingly.
         """
 
-    def update(self, **kwargs) -> None:
+        if isinstance(self.connection, (RandomConnection, DenseConnection)):
+            self.update = self._update
+        elif isinstance(self.connection, (ConvolutionalConnection, TorchConvolutionalConnection)):
+            self.update = self.conv_update
+        else:
+            raise NotImplementedError(
+                "This learning rule is not supported for this Connection type."
+            )
+
+    def _update(self, **kwargs) -> None:
         """
-        TODO.
 
         Implement the dynamics and updating rule. You might need to call the\
         parent method.
         """
-        pass
+        self.connection.w -= self.connection.pre.s.unsqueeze(1).float() @ (
+                self.connection.post.traces.unsqueeze(0) * self.lr[0])
+        self.connection.w += self.connection.pre.traces.unsqueeze(1) @ (
+                self.connection.post.s.unsqueeze(0).float() * self.lr[1])
+        super(STDP, self).update()
+
+    def conv_update(self, **kwargs) -> None:
+        """
+
+        Implement the dynamics and updating rule. You might need to call the\
+        parent method.
+        """
+        winners = kwargs.get('winners', None)
+        assert winners is not None, 'Winners list required.'
+
+        for winner in winners:
+            post_s = self.connection.post.s[winner[0], winner[1], winner[2]].flatten()
+            post_traces = self.connection.post.traces[winner[0], winner[1], winner[2]].flatten()
+            pre_s = self.connection.pre.s[0, (winner[1]*self.connection.stride):(winner[1]*self.connection.stride) + self.connection.kernel_size,
+                     (winner[2]*self.connection.stride):(winner[2]*self.connection.stride) + self.connection.kernel_size].flatten()
+            pre_traces = self.connection.pre.traces[0, (winner[1]*self.connection.stride):(winner[1]*self.connection.stride) + self.connection.kernel_size,
+                          (winner[2]*self.connection.stride):(winner[2]*self.connection.stride) + self.connection.kernel_size].flatten()
+            # print(post_s.shape, post_traces.shape, pre_s.shape, pre_traces.shape)
+            self.connection.w[winner[0]] -= (pre_s.unsqueeze(1).float() @ (
+                    post_traces.unsqueeze(0) * self.lr[0])).reshape(self.connection.w[winner[0]].shape)
+            self.connection.w[winner[0]] += (pre_traces.unsqueeze(1) @ (
+                    post_s.unsqueeze(0).float() * self.lr[1])).reshape(self.connection.w[winner[0]].shape)
+            super(STDP, self).update()
 
 
 class FlatSTDP(LearningRule):
@@ -164,11 +200,11 @@ class FlatSTDP(LearningRule):
     """
 
     def __init__(
-        self,
-        connection: AbstractConnection,
-        lr: Optional[Union[float, Sequence[float]]] = None,
-        weight_decay: float = 0.,
-        **kwargs
+            self,
+            connection: AbstractConnection,
+            lr: Optional[Union[float, Sequence[float]]] = None,
+            weight_decay: float = 0.,
+            **kwargs
     ) -> None:
         super().__init__(
             connection=connection,
@@ -182,15 +218,60 @@ class FlatSTDP(LearningRule):
         Consider the additional required parameters and fill the body\
         accordingly.
         """
-
-    def update(self, **kwargs) -> None:
+        self.window = kwargs.get('window', 10)
+        if isinstance(self.connection, (RandomConnection, DenseConnection)):
+            self.update = self._update
+        elif isinstance(self.connection, (ConvolutionalConnection, TorchConvolutionalConnection)):
+            self.update = self.conv_update
+        else:
+            raise NotImplementedError(
+                "This learning rule is not supported for this Connection type."
+            )
+    def _update(self, **kwargs) -> None:
         """
         TODO.
 
         Implement the dynamics and updating rule. You might need to call the\
         parent method.
         """
-        pass
+
+        self.connection.w -= self.connection.pre.s.unsqueeze(1).float() @ (
+                torch.where(self.connection.post.traces.unsqueeze(0) > torch.pow(self.connection.post.trace_decay,
+                                                                                 self.window / self.connection.post.dt),
+                            1.0, 0.0) * self.lr[0])
+        self.connection.w += torch.where(
+            self.connection.pre.traces.unsqueeze(1) > torch.pow(self.connection.pre.trace_decay,
+                                                                self.window / self.connection.pre.dt), 1.0, 0.0) @ (
+                                     self.connection.post.s.unsqueeze(0).float() * self.lr[1])
+        super(FlatSTDP, self).update()
+
+    def conv_update(self, **kwargs) -> None:
+        """
+
+        Implement the dynamics and updating rule. You might need to call the\
+        parent method.
+        """
+        winners = kwargs.get('winners', None)
+        assert winners is not None, 'Winners list required.'
+
+        for winner in winners:
+            post_s = self.connection.post.s[winner[0], winner[1], winner[2]].flatten()
+            post_traces = self.connection.post.traces[winner[0], winner[1], winner[2]].flatten()
+            pre_s = self.connection.pre.s[0, (winner[1]*self.connection.stride):(winner[1]*self.connection.stride) + self.connection.kernel_size,
+                     (winner[2]*self.connection.stride):(winner[2]*self.connection.stride) + self.connection.kernel_size].flatten()
+            pre_traces = self.connection.pre.traces[0, (winner[1]*self.connection.stride):(winner[1]*self.connection.stride) + self.connection.kernel_size,
+                          (winner[2]*self.connection.stride):(winner[2]*self.connection.stride) + self.connection.kernel_size].flatten()
+            # print(post_s.shape, post_traces.shape, pre_s.shape, pre_traces.shape)
+
+            self.connection.w[winner[0]] -= (pre_s.unsqueeze(1).float() @ (
+                    torch.where(post_traces.unsqueeze(0) > torch.pow(self.connection.post.trace_decay,
+                                                                                     self.window / self.connection.post.dt),
+                                1.0, 0.0) * self.lr[0])).reshape(self.connection.w[winner[0]].shape)
+            self.connection.w[winner[0]] += (torch.where(
+                pre_traces.unsqueeze(1) > torch.pow(self.connection.pre.trace_decay,
+                                                                    self.window / self.connection.pre.dt), 1.0, 0.0) @ (
+                                         post_s.unsqueeze(0).float() * self.lr[1])).reshape(self.connection.w[winner[0]].shape)
+            super(FlatSTDP, self).update()
 
 
 class RSTDP(LearningRule):
@@ -202,11 +283,12 @@ class RSTDP(LearningRule):
     """
 
     def __init__(
-        self,
-        connection: AbstractConnection,
-        lr: Optional[Union[float, Sequence[float]]] = None,
-        weight_decay: float = 0.,
-        **kwargs
+            self,
+            connection: AbstractConnection,
+            lr: Optional[Union[float, Sequence[float]]] = None,
+            weight_decay: float = 0.,
+            tau_c: int = 5,
+            **kwargs
     ) -> None:
         super().__init__(
             connection=connection,
@@ -220,6 +302,8 @@ class RSTDP(LearningRule):
         Consider the additional required parameters and fill the body\
         accordingly.
         """
+        self.c = torch.zeros(*self.connection.w.shape)
+        self.tau_c = tau_c
 
     def update(self, **kwargs) -> None:
         """
@@ -229,7 +313,16 @@ class RSTDP(LearningRule):
         parent method. Make sure to consider the reward value as a given keyword
         argument.
         """
-        pass
+        dt = self.connection.pre.dt
+        dopamine = kwargs["dopamine"]
+        self.c += (-self.c / self.tau_c) * dt
+        self.c -= self.connection.pre.s.unsqueeze(1).float() @ (
+                self.connection.post.traces.unsqueeze(0) * self.lr[0]) * dt
+        self.c += self.connection.pre.traces.unsqueeze(1) @ (
+                self.connection.post.s.unsqueeze(0).float() * self.lr[1]) * dt
+        self.connection.w += dopamine * self.c * dt
+
+        super(RSTDP, self).update()
 
 
 class FlatRSTDP(LearningRule):
@@ -241,11 +334,11 @@ class FlatRSTDP(LearningRule):
     """
 
     def __init__(
-        self,
-        connection: AbstractConnection,
-        lr: Optional[Union[float, Sequence[float]]] = None,
-        weight_decay: float = 0.,
-        **kwargs
+            self,
+            connection: AbstractConnection,
+            lr: Optional[Union[float, Sequence[float]]] = None,
+            weight_decay: float = 0.,
+            **kwargs
     ) -> None:
         super().__init__(
             connection=connection,
@@ -259,7 +352,8 @@ class FlatRSTDP(LearningRule):
         Consider the additional required parameters and fill the body\
         accordingly.
         """
-
+        self.window = kwargs.get('window', 10)
+        self.c = torch.zeros(*self.connection.w.shape)
     def update(self, **kwargs) -> None:
         """
         TODO.
@@ -268,4 +362,17 @@ class FlatRSTDP(LearningRule):
         parent method. Make sure to consider the reward value as a given keyword
         argument.
         """
-        pass
+
+
+        dopamine = kwargs["dopamine"]
+
+        self.connection.w -= self.connection.pre.s.unsqueeze(1).float() @ (
+                torch.where(self.connection.post.traces.unsqueeze(0) > torch.pow(self.connection.post.trace_decay,
+                                                                                 self.window / self.connection.post.dt),
+                            1.0, 0.0) * self.lr[0]) * sign(dopamine)
+        self.connection.w += torch.where(
+            self.connection.pre.traces.unsqueeze(1) > torch.pow(self.connection.pre.trace_decay,
+                                                                self.window / self.connection.pre.dt), 1.0, 0.0) @ (
+                                     self.connection.post.s.unsqueeze(0).float() * self.lr[1]) * sign(dopamine)
+
+        super(FlatRSTDP, self).update()

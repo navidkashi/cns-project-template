@@ -4,7 +4,7 @@ Module for encoding data into spike.
 
 from abc import ABC, abstractmethod
 from typing import Optional
-
+from cnsproject.utils import gaussian
 import torch
 
 
@@ -84,19 +84,20 @@ class Time2FirstSpikeEncoder(AbstractEncoder):
             device=device,
             **kwargs
         )
-        """
-        TODO.
 
-        Add other attributes if needed and fill the body accordingly.
+    def __call__(self, data: torch.Tensor) -> torch.Tensor:
         """
-
-    def __call__(self, data: torch.Tensor) -> None:
-        """
-        TODO.
 
         Implement the computation for coding the data. Return resulting tensor.
         """
-        pass
+        time = int(self.time / self.dt)
+        shape, size = data.shape, data.numel()
+        _data = data.flatten()
+        spikes = torch.zeros((time + 1, size), device=self.device)
+        times = time - (_data * (time / _data.max())).long()
+        spikes[times, torch.arange(size)] = 1
+        spikes = spikes[:-1]
+        return spikes.view(time, *shape).bool()
 
 
 class PositionEncoder(AbstractEncoder):
@@ -110,6 +111,10 @@ class PositionEncoder(AbstractEncoder):
         self,
         time: int,
         dt: Optional[float] = 1.0,
+        sigma: float = 1.0,
+        mu_step: float = 1.0,
+        mu_start: float = 0.0,
+        time_th: float = 0.95,
         device: Optional[str] = "cpu",
         **kwargs
     ) -> None:
@@ -119,19 +124,37 @@ class PositionEncoder(AbstractEncoder):
             device=device,
             **kwargs
         )
-        """
-        TODO.
+        self.sigma = sigma
+        self.mu_step = mu_step
+        self.mu_start = mu_start
+        self.time_th = time_th
+        self.size = kwargs.get("size", None)
 
-        Add other attributes if needed and fill the body accordingly.
+    def __call__(self, data: torch.Tensor) -> torch.Tensor:
         """
-
-    def __call__(self, data: torch.Tensor) -> None:
-        """
-        TODO.
 
         Implement the computation for coding the data. Return resulting tensor.
         """
-        pass
+        _data = data.flatten()
+        if self.size is None:
+            self.size = _data.numel()
+        time = int(self.time / self.dt)
+        neuron_vec = torch.zeros(self.size, device=self.device)
+        times = torch.zeros((_data.numel(), neuron_vec.numel()), device=self.device)
+        for i in range(_data.numel()):
+            for j in range(neuron_vec.numel()):
+                times[i, j] = time - gaussian(_data[i], self.mu_start + self.mu_step * j, self.sigma) * time
+        times[times >= time * self.time_th] = time
+        times = times.long()
+        spikes = torch.zeros(time + 1, neuron_vec.numel(), device=self.device)
+        spikes[times, torch.arange(neuron_vec.numel())] = 1
+        spikes = spikes[:-1]
+        return spikes.view(time, self.size).bool()
+
+
+
+
+
 
 
 class PoissonEncoder(AbstractEncoder):
@@ -139,6 +162,46 @@ class PoissonEncoder(AbstractEncoder):
     Poisson coding.
 
     Implement Poisson coding.
+    """
+
+    def __init__(
+        self,
+        time: int,
+        dt: Optional[float] = 1.0,
+        max_rate: int = 100,
+        device: Optional[str] = "cpu",
+        **kwargs
+    ) -> None:
+        super().__init__(
+            time=time,
+            dt=dt,
+            device=device,
+            **kwargs
+        )
+        self.max_rate = max_rate
+
+    def __call__(self, data: torch.Tensor) -> torch.Tensor:
+        """
+
+
+        Implement the computation for coding the data. Return resulting tensor.
+        """
+
+        time = int(self.time / self.dt)
+
+        rate = torch.zeros(*data.shape, device=self.device)
+        rate[:] = ((data.view(*data.shape) / data.max()) * self.max_rate)
+
+        rand = torch.rand(time, *data.shape, device=self.device)
+        spikes = torch.where(rand <= rate * (self.dt / 1000.0), 1, 0)
+
+        return spikes.view(time, *data.shape).bool()
+
+
+class Intensity2Latency(AbstractEncoder):
+    """
+    Intensity2Latency coding.
+
     """
 
     def __init__(
@@ -154,16 +217,25 @@ class PoissonEncoder(AbstractEncoder):
             device=device,
             **kwargs
         )
-        """
-        TODO.
 
-        Add other attributes if needed and fill the body accordingly.
+    def __call__(self, data: torch.Tensor) -> torch.Tensor:
         """
-
-    def __call__(self, data: torch.Tensor) -> None:
-        """
-        TODO.
 
         Implement the computation for coding the data. Return resulting tensor.
         """
-        pass
+        time = int(self.time / self.dt)
+        shape, size = data.shape, data.numel()
+        bins = []
+        _data = data.flatten()
+        nonzero_cnt = torch.nonzero(_data).size()[0]
+        bin_size = nonzero_cnt // time
+        sorted_data = torch.sort(_data, descending=True)
+        sorted_bins_value, sorted_bins_idx = torch.split(sorted_data[0], bin_size), torch.split(
+            sorted_data[1], bin_size)
+        for i in range(time):
+            spike_map = torch.zeros(sorted_data[0].shape)
+            spike_map.scatter_(0, sorted_bins_idx[i], sorted_bins_value[i])
+            spike_map = spike_map.reshape(tuple(data.shape))
+
+            bins.append(spike_map.squeeze(0).float())
+        return torch.stack(bins).bool()

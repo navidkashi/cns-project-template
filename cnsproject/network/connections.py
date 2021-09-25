@@ -3,12 +3,12 @@ Module for connections between neural populations.
 """
 
 from abc import ABC, abstractmethod
-from typing import Union, Sequence
+from typing import Union, Sequence, Tuple
 
 import torch
 
 from .neural_populations import NeuralPopulation
-
+import torch.nn.functional as F
 
 class AbstractConnection(ABC, torch.nn.Module):
     """
@@ -66,12 +66,12 @@ class AbstractConnection(ABC, torch.nn.Module):
     """
 
     def __init__(
-        self,
-        pre: NeuralPopulation,
-        post: NeuralPopulation,
-        lr: Union[float, Sequence[float]] = None,
-        weight_decay: float = 0.0,
-        **kwargs
+            self,
+            pre: NeuralPopulation,
+            post: NeuralPopulation,
+            lr: Union[float, Sequence[float]] = None,
+            weight_decay: float = 0.0,
+            **kwargs
     ) -> None:
         super().__init__()
 
@@ -85,6 +85,11 @@ class AbstractConnection(ABC, torch.nn.Module):
 
         self.weight_decay = weight_decay
 
+        self.wmin = kwargs.get('wmin', 0.)
+        self.wmax = kwargs.get('wmax', 4)
+        self.norm = kwargs.get('norm', None)
+
+
         from ..learning.learning_rules import NoOp
 
         learning_rule = kwargs.get('learning_rule', NoOp)
@@ -95,9 +100,6 @@ class AbstractConnection(ABC, torch.nn.Module):
             weight_decay=weight_decay,
             **kwargs
         )
-        self.wmin = kwargs.get('wmin', 0.)
-        self.wmax = kwargs.get('wmax', 1.)
-        self.norm = kwargs.get('norm', None)
 
     @abstractmethod
     def compute(self, s: torch.Tensor) -> None:
@@ -115,6 +117,7 @@ class AbstractConnection(ABC, torch.nn.Module):
         None
 
         """
+
         pass
 
     @abstractmethod
@@ -165,12 +168,12 @@ class DenseConnection(AbstractConnection):
     """
 
     def __init__(
-        self,
-        pre: NeuralPopulation,
-        post: NeuralPopulation,
-        lr: Union[float, Sequence[float]] = None,
-        weight_decay: float = 0.0,
-        **kwargs
+            self,
+            pre: NeuralPopulation,
+            post: NeuralPopulation,
+            lr: Union[float, Sequence[float]] = None,
+            weight_decay: float = 0.0,
+            **kwargs
     ) -> None:
         super().__init__(
             pre=pre,
@@ -179,30 +182,29 @@ class DenseConnection(AbstractConnection):
             weight_decay=weight_decay,
             **kwargs
         )
-        """
-        TODO.
+        self.wmin + torch.rand(pre.s.numel(), post.s.numel()) * (self.wmax - self.wmin)
+        self.w = kwargs.get("w", self.wmin + torch.rand(pre.s.numel(), post.s.numel()) * (self.wmax - self.wmin))
 
-        1. Add more parameters if needed.
-        2. Fill the body accordingly.
+    def compute(self, s: torch.Tensor = None) -> torch.Tensor:
         """
-
-    def compute(self, s: torch.Tensor) -> None:
-        """
-        TODO.
-
         Implement the computation of post-synaptic population activity given the
         activity of the pre-synaptic population.
         """
-        pass
+        if self.pre.is_inhibitory:
+            post_input = torch.matmul(self.pre.s.float(), -self.w / (self.post.s.numel() / 100.)).view(
+                *self.post.s.shape)
+        else:
+            post_input = torch.matmul(self.pre.s.float(), self.w / (self.post.s.numel() / 100.)).view(
+                *self.post.s.shape)
+        return post_input
 
     def update(self, **kwargs) -> None:
         """
-        TODO.
 
         Update the connection weights based on the learning rule computations.\
         You might need to call the parent method.
         """
-        pass
+        super(DenseConnection, self).update(**kwargs)
 
     def reset_state_variables(self) -> None:
         """
@@ -210,7 +212,7 @@ class DenseConnection(AbstractConnection):
 
         Reset all the state variables of the connection.
         """
-        pass
+        super(DenseConnection, self).reset_state_variables()
 
 
 class RandomConnection(AbstractConnection):
@@ -222,12 +224,13 @@ class RandomConnection(AbstractConnection):
     """
 
     def __init__(
-        self,
-        pre: NeuralPopulation,
-        post: NeuralPopulation,
-        lr: Union[float, Sequence[float]] = None,
-        weight_decay: float = 0.0,
-        **kwargs
+            self,
+            pre: NeuralPopulation,
+            post: NeuralPopulation,
+            connection_rate: float,
+            lr: Union[float, Sequence[float]] = None,
+            weight_decay: float = 0.0,
+            **kwargs
     ) -> None:
         super().__init__(
             pre=pre,
@@ -236,21 +239,32 @@ class RandomConnection(AbstractConnection):
             weight_decay=weight_decay,
             **kwargs
         )
-        """
-        TODO.
+        super().__init__(pre, post, lr, weight_decay, **kwargs)
+        assert 0. < connection_rate < 1., \
+            "Connection rate must be in (0, 1)"
 
-        1. Add more parameters if needed.
-        2. Fill the body accordingly.
-        """
+        self.w = kwargs.get("w", None)
+        if self.w is None:
+            self.w = self.wmin + torch.rand(pre.s.numel(), post.s.numel()) * (self.wmax - self.wmin)
 
-    def compute(self, s: torch.Tensor) -> None:
+        n = pre.s.numel() * post.s.numel()
+        connected_idx = torch.randperm(n)[:round(n * connection_rate)]
+        self.rand_mask = torch.flatten(torch.ones(pre.s.numel(), post.s.numel())).scatter_(0, connected_idx, 0).view(
+            pre.s.numel(), post.s.numel()).bool()
+        self.w.masked_fill_(self.rand_mask, 0)
+
+    def compute(self, s: torch.Tensor = None) -> torch.Tensor:
         """
-        TODO.
 
         Implement the computation of post-synaptic population activity given the
         activity of the pre-synaptic population.
         """
-        pass
+        if self.pre.is_inhibitory:
+            post_input = torch.matmul(self.pre.s.float(), -self.w / (self.post.s.numel() / 100.)).view(
+                *self.post.s.size)
+        else:
+            post_input = torch.matmul(self.pre.s.float(), self.w / (self.post.s.numel() / 100.)).view(*self.post.s.size)
+        return post_input
 
     def update(self, **kwargs) -> None:
         """
@@ -259,7 +273,7 @@ class RandomConnection(AbstractConnection):
         Update the connection weights based on the learning rule computations.\
         You might need to call the parent method.
         """
-        pass
+        super(RandomConnection, self).update(**kwargs)
 
     def reset_state_variables(self) -> None:
         """
@@ -279,12 +293,15 @@ class ConvolutionalConnection(AbstractConnection):
     """
 
     def __init__(
-        self,
-        pre: NeuralPopulation,
-        post: NeuralPopulation,
-        lr: Union[float, Sequence[float]] = None,
-        weight_decay: float = 0.0,
-        **kwargs
+            self,
+            pre: NeuralPopulation,
+            post: NeuralPopulation,
+            kernel_size: int,
+            padding: bool = True,
+            stride: int = 1,
+            lr: Union[float, Sequence[float]] = None,
+            weight_decay: float = 0.0,
+            **kwargs
     ) -> None:
         super().__init__(
             pre=pre,
@@ -293,21 +310,51 @@ class ConvolutionalConnection(AbstractConnection):
             weight_decay=weight_decay,
             **kwargs
         )
-        """
-        TODO.
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.stride = stride
+        self.c_in = pre.shape[0]
+        self.h_in = pre.shape[1]
+        self.w_in = pre.shape[2]
+        self.c_out = post.shape[0]
+        self.h_out = post.shape[1]
+        self.w_out = post.shape[2]
+        if self.padding:
+            self.pad_size = self.kernel_size // 2
+        else:
+            self.pad_size = 0
 
-        1. Add more parameters if needed.
-        2. Fill the body accordingly.
-        """
+        self.output_shape = (self.c_out, (self.h_in - kernel_size + self.pad_size * 2) // self.stride + 1,
+                        (self.w_in - kernel_size + self.pad_size * 2) // self.stride + 1)
 
-    def compute(self, s: torch.Tensor) -> None:
+        assert (post.shape[1] == self.output_shape[1] and post.shape[2] == self.output_shape[2]), "Wrong post population shape. Must be " + str(self.output_shape)
+
+        self.w = kwargs.get("w", self.wmin + torch.rand(self.c_out, self.c_in, self.kernel_size, self.kernel_size) * (self.wmax - self.wmin))
+
+
+    def compute(self, s: torch.Tensor = None) -> torch.Tensor:
         """
         TODO.
 
         Implement the computation of post-synaptic population activity given the
         activity of the pre-synaptic population.
         """
-        pass
+        kernel = self.w.clone()
+        image = self.pre.s.clone()
+        if self.padding:
+            padded_image = torch.zeros((image.shape[0], image.shape[1] + self.pad_size * 2, image.shape[2] + self.pad_size * 2))
+            padded_image[:, self.pad_size:-self.pad_size, self.pad_size:-self.pad_size] = image
+        else:
+            padded_image = image.clone()
+        kernel_means = torch.mean(kernel, [2, 3])
+        output = torch.zeros(self.output_shape)
+        for c_out in range(self.c_out):
+            for c_in in range(self.c_in):
+                for i in range(self.output_shape[1]):
+                    for j in range(self.output_shape[2]):
+                        output[c_out, i, j] += torch.sum(
+                            torch.multiply(padded_image[c_in, i*self.stride:i*self.stride + kernel.shape[2], j*self.stride:j*self.stride + kernel.shape[3]], kernel[c_out, c_in] - kernel_means[c_out, c_in]))
+        return output
 
     def update(self, **kwargs) -> None:
         """
@@ -339,12 +386,16 @@ class PoolingConnection(AbstractConnection):
     """
 
     def __init__(
-        self,
-        pre: NeuralPopulation,
-        post: NeuralPopulation,
-        lr: Union[float, Sequence[float]] = None,
-        weight_decay: float = 0.0,
-        **kwargs
+            self,
+            pre: NeuralPopulation,
+            post: NeuralPopulation,
+            kernel_size: int,
+            padding: bool = True,
+            stride: int = 1,
+            trace_scale: float = 1.0,
+            lr: Union[float, Sequence[float]] = None,
+            weight_decay: float = 0.0,
+            **kwargs
     ) -> None:
         super().__init__(
             pre=pre,
@@ -353,21 +404,51 @@ class PoolingConnection(AbstractConnection):
             weight_decay=weight_decay,
             **kwargs
         )
-        """
-        TODO.
+        self.kernel_size = kernel_size
+        self.decay = kwargs.get('decay', 0.0)
+        self.firing_trace = torch.zeros(self.pre.s.shape)
+        self.padding = padding
+        self.stride = stride
+        self.trace_scale = trace_scale
+        self.c_in = pre.shape[0]
+        self.h_in = pre.shape[1]
+        self.w_in = pre.shape[2]
+        self.c_out = post.shape[0]
+        self.h_out = post.shape[1]
+        self.w_out = post.shape[2]
+        if self.padding:
+            self.pad_size = self.kernel_size // 2
+        else:
+            self.pad_size = 0
 
-        1. Add more parameters if needed.
-        2. Fill the body accordingly.
-        """
+        self.output_shape = (self.c_out, (self.h_in - kernel_size + self.pad_size * 2) // self.stride + 1,
+                        (self.w_in - kernel_size + self.pad_size * 2) // self.stride + 1)
 
-    def compute(self, s: torch.Tensor) -> None:
+        assert (self.c_out == self.c_in and post.shape[1] == self.output_shape[1] and post.shape[2] == self.output_shape[2]), "Wrong post population shape. Must be " + str(self.output_shape)
+
+
+    def compute(self, s: torch.Tensor = None) -> torch.Tensor:
         """
         TODO.
 
         Implement the computation of post-synaptic population activity given the
         activity of the pre-synaptic population.
         """
-        pass
+        self.firing_trace *= (1. - self.decay)
+        self.firing_trace += self.pre.s * self.trace_scale
+        image = self.firing_trace.clone()
+        if self.padding:
+            padded_image = torch.zeros(
+                (image.shape[0], image.shape[1] + self.pad_size * 2, image.shape[2] + self.pad_size * 2))
+            padded_image[:, self.pad_size:-self.pad_size, self.pad_size:-self.pad_size] = image
+        else:
+            padded_image = image.clone()
+        output = torch.zeros(self.output_shape)
+        for i in range(self.output_shape[1]):
+            for j in range(self.output_shape[2]):
+                output[:, i, j] = torch.max(torch.max(padded_image[:, i*self.stride:i*self.stride + self.kernel_size, j*self.stride:j*self.stride + self.kernel_size], 1)[0], 1)[0][:]
+
+        return output
 
     def update(self, **kwargs) -> None:
         """
@@ -387,3 +468,183 @@ class PoolingConnection(AbstractConnection):
         Reset all the state variables of the connection.
         """
         pass
+
+class TorchConvolutionalConnection(AbstractConnection):
+    """
+    Specify a convolutional synaptic connection between neural populations.
+
+    Implement the convolutional connection pattern following the abstract\
+    connection template.
+    """
+
+    def __init__(
+            self,
+            pre: NeuralPopulation,
+            post: NeuralPopulation,
+            kernel_size: int,
+            padding: bool = True,
+            stride: int = 1,
+            lr: Union[float, Sequence[float]] = None,
+            weight_decay: float = 0.0,
+            **kwargs
+    ) -> None:
+        super().__init__(
+            pre=pre,
+            post=post,
+            lr=lr,
+            weight_decay=weight_decay,
+            **kwargs
+        )
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.stride = stride
+        self.c_in = pre.shape[0]
+        self.h_in = pre.shape[1]
+        self.w_in = pre.shape[2]
+        self.c_out = post.shape[0]
+        self.h_out = post.shape[1]
+        self.w_out = post.shape[2]
+        if self.padding:
+            self.pad_size = self.kernel_size // 2
+        else:
+            self.pad_size = 0
+
+        self.output_shape = (self.c_out, (self.h_in - kernel_size + self.pad_size * 2) // self.stride + 1,
+                        (self.w_in - kernel_size + self.pad_size * 2) // self.stride + 1)
+
+        assert (post.shape[1] == self.output_shape[1] and post.shape[2] == self.output_shape[2]), "Wrong post population shape. Must be " + str(self.output_shape)
+
+        self.w = kwargs.get("w", self.wmin + torch.rand(self.c_out, self.c_in, self.kernel_size, self.kernel_size) * (self.wmax - self.wmin))
+
+
+    def compute(self, s: torch.Tensor = None) -> torch.Tensor:
+        """
+        TODO.
+
+        Implement the computation of post-synaptic population activity given the
+        activity of the pre-synaptic population.
+        """
+        output = F.conv2d(
+            self.pre.s.float().unsqueeze(0),
+            self.w,
+            stride=(self.stride, self.stride),
+            padding=(self.pad_size, self.pad_size),
+        ).squeeze(0)
+        # print(output.shape)
+        return output
+
+    def update(self, **kwargs) -> None:
+        """
+        TODO.
+
+        Update the connection weights based on the learning rule computations.
+        You might need to call the parent method.
+        """
+        super(TorchConvolutionalConnection, self).update(**kwargs)
+
+    def reset_state_variables(self) -> None:
+        """
+        TODO.
+
+        Reset all the state variables of the connection.
+        """
+        pass
+
+
+class TorchPoolingConnection(AbstractConnection):
+    """
+    Specify a pooling synaptic connection between neural populations.
+
+    Implement the pooling connection pattern following the abstract connection\
+    template. Consider a parameter for defining the type of pooling.
+
+    Note: The pooling operation does not support learning. You might need to\
+    make some modifications in the defined structure of this class.
+    """
+
+    def __init__(
+            self,
+            pre: NeuralPopulation,
+            post: NeuralPopulation,
+            kernel_size: int,
+            padding: bool = True,
+            stride: int = 1,
+            trace_scale: float = 1.0,
+            lr: Union[float, Sequence[float]] = None,
+            weight_decay: float = 0.0,
+            **kwargs
+    ) -> None:
+        super().__init__(
+            pre=pre,
+            post=post,
+            lr=lr,
+            weight_decay=weight_decay,
+            **kwargs
+        )
+        self.kernel_size = kernel_size
+        self.decay = kwargs.get('decay', 0.0)
+        self.firing_trace = torch.zeros(self.pre.s.shape)
+        self.padding = padding
+        self.stride = stride
+        self.trace_scale = trace_scale
+        self.c_in = pre.shape[0]
+        self.h_in = pre.shape[1]
+        self.w_in = pre.shape[2]
+        self.c_out = post.shape[0]
+        self.h_out = post.shape[1]
+        self.w_out = post.shape[2]
+        if self.padding:
+            self.pad_size = self.kernel_size // 2
+        else:
+            self.pad_size = 0
+
+        self.output_shape = (self.c_out, (self.h_in - kernel_size + self.pad_size * 2) // self.stride + 1,
+                        (self.w_in - kernel_size + self.pad_size * 2) // self.stride + 1)
+
+        assert (self.c_out == self.c_in and post.shape[1] == self.output_shape[1] and post.shape[2] == self.output_shape[2]), "Wrong post population shape. Must be " + str(self.output_shape)
+
+
+    def compute(self, s: torch.Tensor = None) -> torch.Tensor:
+        """
+        TODO.
+
+        Implement the computation of post-synaptic population activity given the
+        activity of the pre-synaptic population.
+        """
+        self.firing_trace *= (1. - self.decay)
+        self.firing_trace += self.pre.s.float() * self.trace_scale
+        # print(self.firing_trace.unsqueeze(1).shape)
+        output, indices = F.max_pool2d(
+            self.firing_trace.unsqueeze(1),
+            kernel_size=(self.kernel_size, self.kernel_size),
+            stride=(self.stride, self.stride),
+            padding=(self.pad_size, self.pad_size),
+            return_indices=True
+        )
+        # print(output)
+        # output = torch.zeros(self.output_shape)
+        # output[0, indices.squeeze(0)[0]] = 10.
+        # print(output.shape)
+        return output.squeeze(0)
+        # s = self.pre.s.clone()
+        # return s.flatten(2).gather(2, indices.flatten(2)).view_as(indices).float()
+
+    def update(self, **kwargs) -> None:
+        """
+        TODO.
+
+        Update the connection weights based on the learning rule computations.\
+        You might need to call the parent method.
+
+        Note: You should be careful with this method.
+        """
+        pass
+
+    def reset_state_variables(self) -> None:
+        """
+        TODO.
+
+        Reset all the state variables of the connection.
+        """
+        pass
+
